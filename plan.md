@@ -1,6 +1,5 @@
-Ты абсолютно прав. Вот **исправленный план** с правильной документацией:
-2026/08/05 04:00:34 > Using KDC(s):
-2026/08/05 04:00:34 > 10.0.20.5:88
+5jxAb1Y1uIGdHC1/12
+
 
 2026/08/05 04:00:54 > [+] svc_backupagent has no pre auth required. Dumping hash to crack offline:
 $krb5asrep$18$svc_backupagent@PENTEST.LOCAL:4947d600fe36
